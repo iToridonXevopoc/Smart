@@ -1,7 +1,6 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { chromium } = require('playwright');
 
 // ---------- CONFIG ----------
 // Railway Variables set karoth ewa use wenawa, nathnam methana thiyena values use wenawa.
@@ -10,6 +9,8 @@ const PASS = process.env.TRAX_PASSWORD || '202561208202690Ts@@@@';
 const BASE = process.env.TRAX_BASE || 'https://smart-prod.trax-cloud.com';
 const PORT = parseInt(process.env.PORT || '3000');
 const HEADLESS = process.env.HEADLESS !== 'false';
+const ADMIN_KEY = process.env.ACCESS_TOKEN || '';   // needed only for /admin/cookie
+const INITIAL_COOKIE = process.env.TRAX_COOKIE || ''; // optional: session cookie pushed from outside
 const DASH_URL = `${BASE}/leader-dashboard/dashboard`;
 
 // SLA in minutes per project. Any project not listed here gets DEFAULT_SLA (24 hours).
@@ -38,9 +39,8 @@ if (!USER || !PASS) { console.error('Trax username/password missing'); process.e
 const ALLOWED_TASK_TYPES = ['voting_engine', 'stitching', 'validation', 'voting'];
 const SLA_TYPES = ['validation', 'stitching'];
 
-let browser, context, page;
+let cookieHeader = INITIAL_COOKIE;
 let loggingIn = null;
-let loggedIn = false;
 let lastError = null;
 const startTimes = new Map();
 
@@ -48,14 +48,23 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 const fmt = s => `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m ${s % 60}s`;
 class AuthError extends Error {}
 
-// ---------- Login ----------
-async function login() {
-  if (loggingIn) return loggingIn;
-  loggingIn = (async () => {
-    log('Logging in...');
-    loggedIn = false;
-    if (page) await page.close().catch(() => {});
-    page = await context.newPage();
+// ---------- Login (browser is opened ONLY while logging in, then closed to free RAM) ----------
+async function browserLogin() {
+  log('Logging in (browser)...');
+  const { chromium } = require('playwright');
+  const browser = await chromium.launch({
+    headless: HEADLESS,
+    args: [
+      '--no-sandbox', '--disable-dev-shm-usage', '--disable-gpu', '--disable-software-rasterizer',
+      '--disable-extensions', '--disable-background-networking', '--no-zygote',
+      '--renderer-process-limit=1', '--js-flags=--max-old-space-size=256',
+    ],
+  });
+  try {
+    const context = await browser.newContext();
+    await context.route('**/*', route =>
+      ['image', 'media', 'font'].includes(route.request().resourceType()) ? route.abort() : route.continue());
+    const page = await context.newPage();
     await page.goto(DASH_URL, { waitUntil: 'domcontentloaded' });
     await page.waitForSelector('input[type="password"]', { timeout: 20000 }).catch(() => {});
     const pass = await page.$('input[type="password"]');
@@ -74,31 +83,40 @@ async function login() {
       ]);
       await page.waitForTimeout(4000);
     }
-    const stillLogin = await page.$('input[type="password"]');
-    if (stillLogin) {
-      await page.screenshot({ path: 'login-failed.png' }).catch(() => {});
-      throw new Error('Login failed (password field still visible). Check login-failed.png (MFA/captcha/wrong password?)');
+    if (await page.$('input[type="password"]')) {
+      throw new Error('Login failed (password field still visible). MFA/captcha/wrong password? Use get-cookie.js as a fallback.');
     }
-    loggedIn = true;
-    log('Login OK');
-    // Only the session cookies are needed for API calls, so close the heavy page to save RAM
-    await page.close().catch(() => {});
-    page = null;
-  })().finally(() => { loggingIn = null; });
+    const cookies = await context.cookies();
+    cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+    lastError = null;
+    log('Login OK, cookies:', cookies.length);
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+function login() {
+  if (loggingIn) return loggingIn;
+  loggingIn = browserLogin()
+    .catch(e => { lastError = e.message; throw e; })
+    .finally(() => { loggingIn = null; });
   return loggingIn;
 }
 
-// ---------- Trax fetch ----------
+// ---------- Trax fetch (plain HTTP with the session cookie, no browser) ----------
 async function fetchOnce(project) {
-  const r = await context.request.get(`${BASE}/api/team-leader/${project}/lockedTasks`, {
-    timeout: 12000, headers: { Accept: 'application/json' },
+  if (!cookieHeader) throw new AuthError('no session cookie yet');
+  const r = await fetch(`${BASE}/api/team-leader/${project}/lockedTasks`, {
+    headers: { Accept: 'application/json', Cookie: cookieHeader },
+    redirect: 'manual',
+    signal: AbortSignal.timeout(12000),
   });
-  const status = r.status();
-  const ct = r.headers()['content-type'] || '';
-  if (status === 401) throw new AuthError('session expired (401)');
+  const status = r.status;
+  const ct = r.headers.get('content-type') || '';
+  if (status === 401 || (status >= 300 && status < 400)) throw new AuthError(`session expired (${status})`);
   if (status === 403) throw new Error('no access to this project (403)');
   if (status === 404) throw new Error('project not found (404)');
-  if (!r.ok()) throw new Error(`Trax returned HTTP ${status}`);
+  if (!r.ok) throw new Error(`Trax returned HTTP ${status}`);
   const text = await r.text();
   if (!text.trim()) return [];
   if (!ct.includes('json') && text.trim().startsWith('<')) throw new AuthError('got login page instead of data');
@@ -107,12 +125,13 @@ async function fetchOnce(project) {
 }
 
 async function fetchProject(project) {
-  if (!loggedIn) await login();
   try {
     return await fetchOnce(project);
   } catch (e) {
-    if (e instanceof AuthError) { await login(); return await fetchOnce(project); }
-    throw e;
+    if (!(e instanceof AuthError)) throw e;
+    try { await login(); }
+    catch (le) { throw new Error('Login problem: ' + le.message); }
+    return await fetchOnce(project);
   }
 }
 
@@ -151,7 +170,17 @@ http.createServer(async (req, res) => {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       return res.end(fs.readFileSync(path.join(__dirname, 'dashboard.html')));
     }
-    if (req.url === '/health') return res.end(JSON.stringify({ loggedIn, lastError }));
+    if (req.url === '/health') return res.end(JSON.stringify({ loggedIn: !!cookieHeader, lastError }));
+    if (req.url === '/admin/cookie' && req.method === 'POST') {
+      if (!ADMIN_KEY || req.headers['x-admin-key'] !== ADMIN_KEY) { res.statusCode = 401; return res.end(JSON.stringify({ error: 'Unauthorized' })); }
+      let body = '';
+      for await (const chunk of req) { body += chunk; if (body.length > 20000) break; }
+      const c = (JSON.parse(body || '{}').cookie || '').trim();
+      if (!c) { res.statusCode = 400; return res.end(JSON.stringify({ error: 'cookie missing' })); }
+      cookieHeader = c; lastError = null;
+      log('Cookie updated via /admin/cookie');
+      return res.end(JSON.stringify({ ok: true }));
+    }
     if (req.url.startsWith('/project/')) {
       const u = new URL(req.url, 'http://localhost');
       const name = decodeURIComponent(u.pathname.slice('/project/'.length)).trim().toLowerCase();
@@ -165,37 +194,8 @@ http.createServer(async (req, res) => {
     log('Request error:', req.url, e.message);
     res.statusCode = 502; res.end(JSON.stringify({ error: e.message }));
   }
-}).listen(PORT, '0.0.0.0', () => log(`Server running on port ${PORT}`));
+}).listen(PORT, '0.0.0.0', () => log(`Server running on port ${PORT} (build v3)`));
 
 // ---------- Start ----------
-(async () => {
-  browser = await chromium.launch({
-    headless: HEADLESS,
-    args: [
-      '--no-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-gpu',
-      '--disable-software-rasterizer',
-      '--disable-extensions',
-      '--disable-background-networking',
-      '--no-zygote',
-      '--renderer-process-limit=1',
-      '--js-flags=--max-old-space-size=256',
-    ],
-  });
-  context = await browser.newContext();
-  // Block heavy resources, we do not need them
-  await context.route('**/*', route => {
-    const t = route.request().resourceType();
-    return ['image', 'media', 'font'].includes(t) ? route.abort() : route.continue();
-  });
-  for (let i = 0; i < 5; i++) {
-    try { await login(); lastError = null; break; }
-    catch (e) { lastError = e.message; log(e.message); await new Promise(r => setTimeout(r, 10000)); }
-  }
-  // Keep the session alive (no page needed)
-  setInterval(() => context.request.get(DASH_URL, { timeout: 15000 }).catch(() => {}), 10 * 60 * 1000);
-})();
-
-process.on('SIGINT', async () => { await browser?.close(); process.exit(0); });
-process.on('SIGTERM', async () => { await browser?.close(); process.exit(0); });
+// Server stays alive even if login fails; the first request (or /admin/cookie) retries.
+if (!cookieHeader) login().catch(e => log('Initial login failed:', e.message));
