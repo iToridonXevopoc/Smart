@@ -41,6 +41,7 @@ const SLA_TYPES = ['validation', 'stitching'];
 let browser, context, page;
 let loggingIn = null;
 let loggedIn = false;
+let lastError = null;
 const startTimes = new Map();
 
 const log = (...a) => console.log(new Date().toISOString(), ...a);
@@ -80,6 +81,9 @@ async function login() {
     }
     loggedIn = true;
     log('Login OK');
+    // Only the session cookies are needed for API calls, so close the heavy page to save RAM
+    await page.close().catch(() => {});
+    page = null;
   })().finally(() => { loggingIn = null; });
   return loggingIn;
 }
@@ -147,7 +151,7 @@ http.createServer(async (req, res) => {
       res.setHeader('Content-Type', 'text/html; charset=utf-8');
       return res.end(fs.readFileSync(path.join(__dirname, 'dashboard.html')));
     }
-    if (req.url === '/health') return res.end(JSON.stringify({ loggedIn }));
+    if (req.url === '/health') return res.end(JSON.stringify({ loggedIn, lastError }));
     if (req.url.startsWith('/project/')) {
       const u = new URL(req.url, 'http://localhost');
       const name = decodeURIComponent(u.pathname.slice('/project/'.length)).trim().toLowerCase();
@@ -165,12 +169,32 @@ http.createServer(async (req, res) => {
 
 // ---------- Start ----------
 (async () => {
-  browser = await chromium.launch({ headless: HEADLESS, args: ['--no-sandbox', '--disable-dev-shm-usage'] });
+  browser = await chromium.launch({
+    headless: HEADLESS,
+    args: [
+      '--no-sandbox',
+      '--disable-dev-shm-usage',
+      '--disable-gpu',
+      '--disable-software-rasterizer',
+      '--disable-extensions',
+      '--disable-background-networking',
+      '--no-zygote',
+      '--renderer-process-limit=1',
+      '--js-flags=--max-old-space-size=256',
+    ],
+  });
   context = await browser.newContext();
+  // Block heavy resources, we do not need them
+  await context.route('**/*', route => {
+    const t = route.request().resourceType();
+    return ['image', 'media', 'font'].includes(t) ? route.abort() : route.continue();
+  });
   for (let i = 0; i < 5; i++) {
-    try { await login(); break; } catch (e) { log(e.message); if (i === 4) process.exit(1); await new Promise(r => setTimeout(r, 10000)); }
+    try { await login(); lastError = null; break; }
+    catch (e) { lastError = e.message; log(e.message); await new Promise(r => setTimeout(r, 10000)); }
   }
-  setInterval(() => page && page.reload({ waitUntil: 'domcontentloaded' }).catch(() => {}), 10 * 60 * 1000);
+  // Keep the session alive (no page needed)
+  setInterval(() => context.request.get(DASH_URL, { timeout: 15000 }).catch(() => {}), 10 * 60 * 1000);
 })();
 
 process.on('SIGINT', async () => { await browser?.close(); process.exit(0); });
