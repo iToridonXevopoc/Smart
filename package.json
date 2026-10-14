@@ -1,15 +1,7 @@
 {
-  "name": "trax-locked-tasks-monitor",
+  "name": "trax-dashboard",
   "version": "1.0.0",
   "main": "server.js",
-  "scripts": {
-    "postinstall": "npx playwright install --with-deps chromium",
-    "start": "node server.js"
-  },
-  "dependencies": {
-    "playwright": "1.48.2"
-  },
-  "engines": {
-    "node": ">=18"
-  }
+  "scripts": { "start": "node server.js" },
+  "dependencies": { "playwright": "1.48.0" }
 }
