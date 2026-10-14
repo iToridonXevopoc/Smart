@@ -1,10 +1,15 @@
 {
-  "name": "trax-team-monitor-server",
+  "name": "trax-locked-tasks-monitor",
   "version": "1.0.0",
   "main": "server.js",
-  "scripts": { "start": "node server.js" },
+  "scripts": {
+    "postinstall": "npx playwright install --with-deps chromium",
+    "start": "node server.js"
+  },
   "dependencies": {
-    "dotenv": "^16.4.5",
-    "playwright": "^1.48.0"
+    "playwright": "1.48.2"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
